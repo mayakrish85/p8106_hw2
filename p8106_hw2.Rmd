@@ -27,8 +27,8 @@ set.seed(2025)
 
 data_split = initial_split(college, prop = 0.8)
 
-training_data = training(data_split)
-testing_data = testing(data_split)
+training_data = training(data_split) %>% select(-college)
+testing_data = testing(data_split) %>% select(-college)
 ```
 
 
@@ -44,13 +44,14 @@ p =
 perc_alumni.grid = seq(from = -10, to = 110, by = 1) # the range of perc_alumni is [0, 100]
 
 fit.ss = smooth.spline(training_data$perc_alumni, training_data$outstate)
-fit.ss$df # generalized CV method uses df = 3.88007
 
 pred.ss = predict(fit.ss, x = perc_alumni.grid)
 pred.ss.df = data.frame(pred = pred.ss$y, perc_alum = perc_alumni.grid)
 
 p + geom_line(aes(x = perc_alum, y = pred), data = pred.ss.df,
 color = rgb(.8, .1, .1, 1)) + theme_bw()
+
+cv_df = fit.ss$df # generalized CV method uses df = 3.88007
 ```
 
 
@@ -63,22 +64,32 @@ df_values <- 2:15
 # Create an empty list to store data frames
 spline_list <- list()
 
+test_mse <- numeric(length(df_values))
+
 # Loop through df values and store predictions
-for (df in df_values) {
+for (i in seq_along(df_values)) {
+  df <- df_values[i]
   
   # Fit smoothing spline
   fit <- smooth.spline(training_data$perc_alumni, training_data$outstate, df = df)
   
   # Get predictions
-  pred <- predict(fit, x = perc_alumni.grid)
+  pred_train <- predict(fit, x = perc_alumni.grid)
+  
+  pred_test <- predict(fit, x = testing_data$perc_alumni)
   
   # Store results in a data frame
   spline_list[[df]] <- tibble(
     perc_alum = perc_alumni.grid,
-    pred = pred$y,
+    pred = pred_train$y,
     df = factor(df)  # Convert df to a factor for faceting
   )
+  
+  # Compute test MSE
+  test_mse[i] <- sqrt(mean((testing_data$outstate - pred_test$y)^2))
 }
+
+best_df <- df_values[which.min(test_mse)]
 
 # Combine all predictions into one data frame
 spline_predictions <- bind_rows(spline_list)
@@ -92,6 +103,70 @@ ggplot(spline_predictions, aes(x = perc_alum, y = pred)) +
        y = "Out of state tuition",
        caption = "Each panel represents a different degree of freedom") +
   theme_bw()
+
+# Plot MSE vs. Degrees of Freedom
+mse_df <- tibble(df = df_values, MSE = test_mse)
+
+ggplot(mse_df, aes(x = df, y = MSE)) +
+  geom_point(color = "blue") +
+  geom_line(color = "blue") +
+  labs(title = "Test MSE vs. Degrees of Freedom",
+       x = "Degrees of Freedom",
+       y = "Test RMSE") +
+  theme_minimal()
 ```
 
-These plots show the spline curves for different degrees of freedom between 3 and 15. For lower df (2-5), the splines are very smooth and almsot completely linear, which may be a sign of not capturing the data entirely. For higher df (>10), the splines may be overfitting the data even though they are less linear. The optimal df is `r fit.ss$df` using the generalized CV method.
+These plots show the spline curves for different degrees of freedom between 3 and 15. For lower df (2-5), the splines are very smooth and almsot completely linear, which may be a sign of not capturing the data entirely. For higher df (>10), the splines may be overfitting the data even though they are less linear. The df resulting from the generalized CV method is `r fit.ss$df` using the generalized CV method. The best df in the manual range is 2.
+
+
+## Part b) MARS MODEL
+
+```{r}
+# matrix of predictors
+x <- model.matrix(outstate ~ ., training_data)[, -1]
+# vector of response
+y <- training_data$outstate
+
+test_x <- model.matrix(outstate ~ ., testing_data)[, -1]
+test_y <- testing_data$outstate
+```
+
+**Fitting a model:**
+
+```{r}
+set.seed(2025)
+
+ctrl1 <- trainControl(method = "cv", number = 10)
+
+# create grid of all possible pairs that can take degree and nprune values
+mars_grid <- expand.grid(degree = 1:3, # number of possible product hinge functions in 1 term
+                         nprune = 2:18) # Upper bound of number of terms in model
+
+mars.fit <- train(x, y, # training dataset
+                  method = "earth",
+                  tuneGrid = mars_grid,
+                  trControl = ctrl1) # 10-fold CV
+
+ggplot(mars.fit)
+```
+
+
+```{r}
+mars.fit$bestTune
+coef(mars.fit$finalModel)
+
+# Calculate MSE.
+mars.pred = predict(mars.fit, newdata = test_x)
+mse.mars = mean((mars.pred - test_y)^2)
+```
+The final model uses 1 product degree, meaning that there should be no hinge function, and 13 total terms are selected. The most important predictors are `perc_alumni`, `grad_rate`, and `ph_d`. The test error (MSE) is 3497772.
+
+**Partial dependency plots:**
+
+```{r}
+p1 <- pdp::partial(mars.fit, pred.var = c("grad_rate"), grid.resolution = 10) |> autoplot()
+p2 <- pdp::partial(mars.fit, pred.var = c("grad_rate", "room_board"), grid.resolution = 10) |>
+pdp::plotPartial(levelplot = FALSE, zlab = "yhat", drape = TRUE, screen = list(z = 20, x = -60))
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+The partial dependency plot on the left represents the relationship between `grad_rate` and `outstate`, whereas the one on the right represents the 2D relationship between `room_board` and `grad_rate` with `outstate`.
